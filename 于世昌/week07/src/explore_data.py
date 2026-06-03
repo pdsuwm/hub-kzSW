@@ -1,8 +1,8 @@
 """
-cluener2020 数据集探索与可视化
+peoples_daily 数据集探索与可视化
 
 教学重点：
-  1. span 标注格式的统计方法（与 BIO 格式的信息等价）
+  1. BIO 标注格式的统计方法（与 span 格式的信息等价）
   2. 各实体类型的分布差异（为什么类别不均衡是NER的难点）
   3. 文本长度分布（影响 BERT max_length 的选择）
   4. 实体长度分布（短实体 vs 长实体的识别难度差异）
@@ -30,8 +30,15 @@ matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Un
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 ROOT = Path(__file__).parent.parent
-DATA_DIR = ROOT / "data" / "cluener"
+DATA_DIR = ROOT / "data" / "peoples_daily"
 FIG_DIR = ROOT / "outputs" / "figures"
+
+ET_LABEL = {"PER": "人名", "ORG": "组织机构", "LOC": "地名"}
+
+
+def load_label_names() -> list[str]:
+    with open(DATA_DIR / "label_names.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def load_split(split: str) -> list:
@@ -41,6 +48,7 @@ def load_split(split: str) -> list:
 
 
 def collect_stats(records: list) -> dict:
+    """从 BIO 格式（tokens + ner_tags）统计实体分布，与 span 格式信息等价。"""
     entity_type_counts = Counter()
     entity_lengths = []
     text_lengths = []
@@ -48,20 +56,29 @@ def collect_stats(records: list) -> dict:
     entities_by_type = {}
 
     for row in records:
-        text = row["text"]
-        text_lengths.append(len(text))
-        label = row.get("label") or {}
+        tokens = row["tokens"]
+        ner_tags = row["ner_tags"]
+        text_lengths.append(len(tokens))
 
         total_entities = 0
-        for etype, spans in label.items():
-            for surface, positions in spans.items():
-                for start, end in positions:
-                    entity_type_counts[etype] += 1
-                    entity_lengths.append(end - start + 1)
-                    total_entities += 1
-                    if etype not in entities_by_type:
-                        entities_by_type[etype] = []
-                    entities_by_type[etype].append(surface)
+        i = 0
+        while i < len(tokens):
+            tag = ner_tags[i]
+            if tag.startswith("B-"):
+                etype = tag[2:]
+                start = i
+                i += 1
+                while i < len(tokens) and ner_tags[i] == f"I-{etype}":
+                    i += 1
+                length = i - start
+                surface = "".join(tokens[start:i])
+
+                entity_type_counts[etype] += 1
+                entity_lengths.append(length)
+                total_entities += 1
+                entities_by_type.setdefault(etype, []).append(surface)
+            else:
+                i += 1
 
         entity_per_sentence.append(total_entities)
 
@@ -74,10 +91,11 @@ def collect_stats(records: list) -> dict:
     }
 
 
-def print_summary(stats_train: dict, stats_val: dict):
+def print_summary(stats_train: dict, stats_val: dict, label_names: list[str]):
     print("=" * 70)
-    print("cluener2020 数据集统计摘要")
+    print("peoples_daily 数据集统计摘要")
     print("=" * 70)
+    print(f"\n【标签体系】共 {len(label_names)} 个：{', '.join(label_names)}")
 
     print("\n【训练集】")
     print(f"  样本数：{len(stats_train['text_lengths'])} 条")
@@ -89,19 +107,13 @@ def print_summary(stats_train: dict, stats_val: dict):
     print(f"  平均实体长度：{sum(stats_train['entity_lengths']) / len(stats_train['entity_lengths']):.1f} 字")
 
     print("\n【各类实体频次（训练集）】")
-    et_label = {
-        "address": "地址", "book": "书名", "company": "公司",
-        "game": "游戏", "government": "政府机构", "movie": "影视作品",
-        "name": "人名", "organization": "组织机构", "position": "职位",
-        "scene": "景点/场所",
-    }
     for etype, cnt in sorted(stats_train["entity_type_counts"].items(), key=lambda x: -x[1]):
-        cn = et_label.get(etype, etype)
+        cn = ET_LABEL.get(etype, etype)
         print(f"  {etype:15s} ({cn:8s}) : {cnt:5d} 条")
 
     print("\n【各类实体示例（训练集，取前5个）】")
     for etype in sorted(stats_train["entities_by_type"]):
-        cn = et_label.get(etype, etype)
+        cn = ET_LABEL.get(etype, etype)
         examples = list(dict.fromkeys(stats_train["entities_by_type"][etype]))[:5]
         print(f"  {etype:15s} ({cn}) : {' | '.join(examples)}")
 
@@ -109,22 +121,17 @@ def print_summary(stats_train: dict, stats_val: dict):
 
 
 def plot_entity_distribution(stats_train: dict):
-    et_label = {
-        "address": "地址", "book": "书名", "company": "公司",
-        "game": "游戏", "government": "政府", "movie": "影视",
-        "name": "人名", "organization": "组织", "position": "职位",
-        "scene": "景点",
-    }
     counts = stats_train["entity_type_counts"]
-    labels = [f"{k}\n({et_label.get(k,k)})" for k in sorted(counts)]
-    values = [counts[k] for k in sorted(counts)]
+    order = [t for t in ["PER", "ORG", "LOC"] if t in counts] or sorted(counts)
+    labels = [f"{k}\n({ET_LABEL.get(k, k)})" for k in order]
+    values = [counts[k] for k in order]
 
-    fig, ax = plt.subplots(figsize=(12, 5))
+    fig, ax = plt.subplots(figsize=(8, 5))
     bars = ax.bar(labels, values, color="#4C72B0", alpha=0.85, edgecolor="white")
     for bar, v in zip(bars, values):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 20, str(v),
                 ha="center", va="bottom", fontsize=9)
-    ax.set_title("cluener2020 各类实体频次分布（训练集）", fontsize=14)
+    ax.set_title("peoples_daily 各类实体频次分布（训练集）", fontsize=14)
     ax.set_ylabel("实体数量")
     ax.set_xlabel("实体类型")
     plt.tight_layout()
@@ -176,13 +183,14 @@ def plot_entity_length_distribution(stats_train: dict):
 def main():
     parse_args()
 
+    label_names = load_label_names()
     train_records = load_split("train")
     val_records = load_split("validation")
 
     stats_train = collect_stats(train_records)
     stats_val = collect_stats(val_records)
 
-    print_summary(stats_train, stats_val)
+    print_summary(stats_train, stats_val, label_names)
 
     print("正在生成可视化图表...")
     plot_entity_distribution(stats_train)
@@ -195,7 +203,7 @@ def main():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="探索 cluener2020 数据集")
+    parser = argparse.ArgumentParser(description="探索 peoples_daily 数据集")
     return parser.parse_args()
 
 
