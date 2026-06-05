@@ -1,203 +1,653 @@
-"""
-cluener2020 数据集探索与可视化
-
-教学重点：
-  1. span 标注格式的统计方法（与 BIO 格式的信息等价）
-  2. 各实体类型的分布差异（为什么类别不均衡是NER的难点）
-  3. 文本长度分布（影响 BERT max_length 的选择）
-  4. 实体长度分布（短实体 vs 长实体的识别难度差异）
-
-使用方式：
-  python explore_data.py
-
-输出：
-  outputs/figures/entity_distribution.png   各类实体频次分布
-  outputs/figures/text_length_distribution.png  文本长度分布
-  outputs/figures/entity_length_distribution.png 实体长度分布
-"""
-
-import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 import json
-import argparse
+import os
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-import matplotlib
+import seaborn as sns
+
+# ==========================
+# 配置
+# ==========================
+
+ROOT = Path(__file__).parent
+DATA_DIR = ROOT / "data"
+OUTPUT_DIR = ROOT / "outputs" / "analysis_output"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-ROOT = Path(__file__).parent.parent
-DATA_DIR = ROOT / "data"
-FIG_DIR = ROOT / "outputs" / "figures"
+sns.set_style("whitegrid")
 
+# ==========================
+# 标签加载
+# ==========================
 
-def load_split(split: str) -> list:
-    path = DATA_DIR / f"{split}.json"
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+label_path = os.path.join(DATA_DIR, "label_names.json")
+print("label_path", label_path)
+with open(label_path, "r", encoding="utf-8") as f:
+    LABELS = json.load(f)
 
+ENTITY_TYPES = sorted(
+    list(
+        {
+            tag[2:]
+            for tag in LABELS
+            if tag != "O"
+        }
+    )
+)
 
-def collect_stats(records: list) -> dict:
-    entity_type_counts = Counter()
-    entity_lengths = []
-    text_lengths = []
-    entity_per_sentence = []
-    entities_by_type = {}
+print("标签集:")
+print(LABELS)
 
-    for row in records:
-        text = row["tokens"]
-        text_lengths.append(len(text))
-        label = row.get("ner_tags") or {}
+print("\n实体类型:")
+print(ENTITY_TYPES)
 
-        total_entities = 0
-        for etype, spans in label.items():
-            for surface, positions in spans.items():
-                for start, end in positions:
-                    entity_type_counts[etype] += 1
-                    entity_lengths.append(end - start + 1)
-                    total_entities += 1
-                    if etype not in entities_by_type:
-                        entities_by_type[etype] = []
-                    entities_by_type[etype].append(surface)
+# ==========================
+# BIO解析
+# ==========================
 
-        entity_per_sentence.append(total_entities)
+def extract_entities(tokens, tags):
 
-    return {
-        "entity_type_counts": entity_type_counts,
-        "entity_lengths": entity_lengths,
-        "text_lengths": text_lengths,
-        "entity_per_sentence": entity_per_sentence,
-        "entities_by_type": entities_by_type,
+    entities = []
+
+    start = None
+    entity_type = None
+
+    for i, tag in enumerate(tags):
+
+        if tag.startswith("B-"):
+
+            if start is not None:
+                entities.append({
+                    "text": "".join(tokens[start:i]),
+                    "type": entity_type,
+                    "start": start,
+                    "end": i - 1,
+                    "length": i - start
+                })
+
+            start = i
+            entity_type = tag[2:]
+
+        elif tag.startswith("I-"):
+
+            if start is None:
+                start = i
+                entity_type = tag[2:]
+
+        else:
+
+            if start is not None:
+                entities.append({
+                    "text": "".join(tokens[start:i]),
+                    "type": entity_type,
+                    "start": start,
+                    "end": i - 1,
+                    "length": i - start
+                })
+
+            start = None
+            entity_type = None
+
+    if start is not None:
+        entities.append({
+            "text": "".join(tokens[start:]),
+            "type": entity_type,
+            "start": start,
+            "end": len(tags)-1,
+            "length": len(tags)-start
+        })
+
+    return entities
+
+# ==========================
+# BIO合法性检查
+# ==========================
+
+def bio_check(tags):
+
+    errors = []
+
+    for i, tag in enumerate(tags):
+
+        if not tag.startswith("I-"):
+            continue
+
+        if i == 0:
+            errors.append(i)
+            continue
+
+        prev = tags[i - 1]
+
+        if prev == "O":
+            errors.append(i)
+
+        elif prev[2:] != tag[2:]:
+            errors.append(i)
+
+    return errors
+
+# ==========================
+# 读取所有数据集
+# ==========================
+
+datasets = {}
+
+for file in Path(DATA_DIR).glob("*.json"):
+
+    if file.name == "label_names.json":
+        continue
+
+    with open(file, "r", encoding="utf-8") as f:
+        datasets[file.stem] = json.load(f)
+
+print("\n发现数据集:")
+for name in datasets:
+    print(name)
+
+# ==========================
+# 全局统计
+# ==========================
+
+sentence_lengths = []
+
+entity_counter = Counter()
+
+entity_text_counter = Counter()
+
+tag_counter = Counter()
+
+entity_lengths = []
+
+position_distribution = []
+
+bio_error_count = 0
+
+entity_len_by_type = defaultdict(list)
+
+co_occurrence = defaultdict(Counter)
+
+dataset_statistics = {}
+
+# ==========================
+# 遍历数据集
+# ==========================
+
+for dataset_name, data in datasets.items():
+
+    sample_count = len(data)
+
+    token_count = 0
+
+    dataset_entity_count = 0
+
+    for sample in data:
+
+        tokens = sample["tokens"]
+        tags = sample["ner_tags"]
+
+        token_count += len(tokens)
+
+        sentence_lengths.append(len(tokens))
+
+        tag_counter.update(tags)
+
+        errors = bio_check(tags)
+
+        bio_error_count += len(errors)
+
+        entities = extract_entities(tokens, tags)
+
+        dataset_entity_count += len(entities)
+
+        current_types = set()
+
+        for ent in entities:
+
+            entity_counter[ent["type"]] += 1
+
+            entity_text_counter[ent["text"]] += 1
+
+            entity_lengths.append(ent["length"])
+
+            entity_len_by_type[ent["type"]].append(
+                ent["length"]
+            )
+
+            current_types.add(ent["type"])
+
+            position_distribution.append(
+                ent["start"] / len(tokens)
+            )
+
+        for t1 in current_types:
+            for t2 in current_types:
+                if t1 != t2:
+                    co_occurrence[t1][t2] += 1
+
+    dataset_statistics[dataset_name] = {
+        "samples": sample_count,
+        "tokens": token_count,
+        "entities": dataset_entity_count
     }
 
+# ==========================
+# 汇总统计
+# ==========================
 
-def print_summary(stats_train: dict, stats_val: dict):
-    print("=" * 70)
-    print("cluener2020 数据集统计摘要")
-    print("=" * 70)
+summary = {
+    "datasets": dataset_statistics,
+    "entity_types": ENTITY_TYPES,
+    "label_count": len(LABELS),
+    "total_entities": sum(entity_counter.values()),
+    "unique_entities": len(entity_text_counter),
+    "bio_errors": bio_error_count,
+    "avg_sentence_length": round(
+        np.mean(sentence_lengths), 2
+    ),
+    "max_sentence_length": int(
+        np.max(sentence_lengths)
+    ),
+    "min_sentence_length": int(
+        np.min(sentence_lengths)
+    )
+}
 
-    print("\n【训练集】")
-    print(f"  样本数：{len(stats_train['text_lengths'])} 条")
-    print(f"  文本平均长度：{sum(stats_train['text_lengths']) / len(stats_train['text_lengths']):.1f} 字")
-    print(f"  文本最大长度：{max(stats_train['text_lengths'])} 字")
-    print(f"  文本长度中位数：{sorted(stats_train['text_lengths'])[len(stats_train['text_lengths'])//2]} 字")
-    print(f"  平均实体数/句：{sum(stats_train['entity_per_sentence']) / len(stats_train['entity_per_sentence']):.2f}")
-    print(f"  实体总数：{sum(stats_train['entity_type_counts'].values())}")
-    print(f"  平均实体长度：{sum(stats_train['entity_lengths']) / len(stats_train['entity_lengths']):.1f} 字")
+with open(
+    os.path.join(
+        OUTPUT_DIR,
+        "dataset_summary.json"
+    ),
+    "w",
+    encoding="utf-8"
+) as f:
+    json.dump(
+        summary,
+        f,
+        ensure_ascii=False,
+        indent=2
+    )
 
-    print("\n【各类实体频次（训练集）】")
-    et_label = {
-        "address": "地址", "book": "书名", "company": "公司",
-        "game": "游戏", "government": "政府机构", "movie": "影视作品",
-        "name": "人名", "organization": "组织机构", "position": "职位",
-        "scene": "景点/场所",
-    }
-    for etype, cnt in sorted(stats_train["entity_type_counts"].items(), key=lambda x: -x[1]):
-        cn = et_label.get(etype, etype)
-        print(f"  {etype:15s} ({cn:8s}) : {cnt:5d} 条")
+# ==========================
+# 图1 标签分布
+# ==========================
 
-    print("\n【各类实体示例（训练集，取前5个）】")
-    for etype in sorted(stats_train["entities_by_type"]):
-        cn = et_label.get(etype, etype)
-        examples = list(dict.fromkeys(stats_train["entities_by_type"][etype]))[:5]
-        print(f"  {etype:15s} ({cn}) : {' | '.join(examples)}")
+plt.figure(figsize=(12, 6))
 
-    print()
+counts = [
+    tag_counter.get(tag, 0)
+    for tag in LABELS
+]
 
+sns.barplot(
+    x=LABELS,
+    y=counts
+)
 
-def plot_entity_distribution(stats_train: dict):
-    et_label = {
-        "address": "地址", "book": "书名", "company": "公司",
-        "game": "游戏", "government": "政府", "movie": "影视",
-        "name": "人名", "organization": "组织", "position": "职位",
-        "scene": "景点",
-    }
-    counts = stats_train["entity_type_counts"]
-    labels = [f"{k}\n({et_label.get(k,k)})" for k in sorted(counts)]
-    values = [counts[k] for k in sorted(counts)]
+plt.title("Tag Distribution")
+plt.xticks(rotation=45)
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    bars = ax.bar(labels, values, color="#4C72B0", alpha=0.85, edgecolor="white")
-    for bar, v in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 20, str(v),
-                ha="center", va="bottom", fontsize=9)
-    ax.set_title("cluener2020 各类实体频次分布（训练集）", fontsize=14)
-    ax.set_ylabel("实体数量")
-    ax.set_xlabel("实体类型")
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "01_tag_distribution.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图2 实体类别分布
+# ==========================
+
+plt.figure(figsize=(8, 5))
+
+counts = [
+    entity_counter.get(t, 0)
+    for t in ENTITY_TYPES
+]
+
+sns.barplot(
+    x=ENTITY_TYPES,
+    y=counts
+)
+
+plt.title("Entity Type Distribution")
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "02_entity_distribution.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图3 句长分布
+# ==========================
+
+plt.figure(figsize=(10, 6))
+
+sns.histplot(
+    sentence_lengths,
+    bins=50,
+    kde=True
+)
+
+plt.title("Sentence Length Distribution")
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "03_sentence_length_distribution.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图4 实体长度分布
+# ==========================
+
+plt.figure(figsize=(10, 6))
+
+sns.histplot(
+    entity_lengths,
+    bins=20,
+    kde=True
+)
+
+plt.title("Entity Length Distribution")
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "04_entity_length_distribution.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图5 高频实体TOP30
+# ==========================
+
+top_entities = entity_text_counter.most_common(30)
+
+if len(top_entities):
+
+    names = [x[0] for x in top_entities]
+    counts = [x[1] for x in top_entities]
+
+    plt.figure(figsize=(12, 8))
+
+    sns.barplot(
+        x=counts,
+        y=names
+    )
+
+    plt.title("Top 30 Frequent Entities")
+
     plt.tight_layout()
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIG_DIR / "entity_distribution.png", dpi=120)
-    print(f"  已保存 → {FIG_DIR / 'entity_distribution.png'}")
+
+    plt.savefig(
+        os.path.join(
+            OUTPUT_DIR,
+            "05_top_entities.png"
+        ),
+        dpi=300
+    )
+
     plt.close()
 
+# ==========================
+# 图6 实体位置分布
+# ==========================
 
-def plot_text_length_distribution(stats_train: dict):
-    lengths = stats_train["text_lengths"]
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.hist(lengths, bins=40, color="#4C72B0", alpha=0.8, edgecolor="white")
-    ax.axvline(x=64, color="red", linestyle="--", linewidth=1.5, label="max_length=64")
-    ax.axvline(x=128, color="orange", linestyle="--", linewidth=1.5, label="max_length=128")
-    p95 = sorted(lengths)[int(len(lengths) * 0.95)]
-    ax.axvline(x=p95, color="green", linestyle="--", linewidth=1.5, label=f"P95={p95}")
-    ax.set_title("文本长度分布（训练集）", fontsize=14)
-    ax.set_xlabel("文本字符数")
-    ax.set_ylabel("样本数")
-    ax.legend()
+plt.figure(figsize=(10, 6))
+
+sns.histplot(
+    position_distribution,
+    bins=20,
+    kde=True
+)
+
+plt.title(
+    "Entity Relative Position Distribution"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "06_entity_position_distribution.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图7 各类别长度箱线图
+# ==========================
+
+rows = []
+
+for t, lengths in entity_len_by_type.items():
+
+    for l in lengths:
+        rows.append({
+            "type": t,
+            "length": l
+        })
+
+if rows:
+
+    df = pd.DataFrame(rows)
+
+    plt.figure(figsize=(10, 6))
+
+    sns.boxplot(
+        data=df,
+        x="type",
+        y="length"
+    )
+
+    plt.title(
+        "Entity Length by Type"
+    )
+
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "text_length_distribution.png", dpi=120)
-    print(f"  已保存 → {FIG_DIR / 'text_length_distribution.png'}")
+
+    plt.savefig(
+        os.path.join(
+            OUTPUT_DIR,
+            "07_entity_length_boxplot.png"
+        ),
+        dpi=300
+    )
+
     plt.close()
-    print(f"  P95 文本长度={p95}，建议 max_length=128")
 
+# ==========================
+# 图8 长尾分析
+# ==========================
 
-def plot_entity_length_distribution(stats_train: dict):
-    from collections import Counter
-    lengths = Counter(stats_train["entity_lengths"])
-    xs = sorted(lengths.keys())
-    ys = [lengths[x] for x in xs]
+freqs = list(
+    entity_text_counter.values()
+)
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.bar([str(x) for x in xs[:20]], ys[:20], color="#55A868", alpha=0.85, edgecolor="white")
-    ax.set_title("实体长度分布（训练集，前20）", fontsize=14)
-    ax.set_xlabel("实体字符数")
-    ax.set_ylabel("出现次数")
+if freqs:
+
+    plt.figure(figsize=(10, 6))
+
+    sns.histplot(
+        freqs,
+        bins=50,
+        log_scale=True
+    )
+
+    plt.title(
+        "Long Tail Entity Distribution"
+    )
+
     plt.tight_layout()
-    fig.savefig(FIG_DIR / "entity_length_distribution.png", dpi=120)
-    print(f"  已保存 → {FIG_DIR / 'entity_length_distribution.png'}")
+
+    plt.savefig(
+        os.path.join(
+            OUTPUT_DIR,
+            "08_long_tail_distribution.png"
+        ),
+        dpi=300
+    )
+
     plt.close()
 
-    avg_len = sum(stats_train["entity_lengths"]) / len(stats_train["entity_lengths"])
-    print(f"  实体平均长度={avg_len:.1f}字，CRF 对短实体边界识别优势更明显")
+# ==========================
+# 图9 实体共现热力图
+# ==========================
 
+matrix = []
 
-def main():
-    parse_args()
+for t1 in ENTITY_TYPES:
 
-    train_records = load_split("train")
-    val_records = load_split("validation")
+    row = []
 
-    stats_train = collect_stats(train_records)
-    stats_val = collect_stats(val_records)
+    for t2 in ENTITY_TYPES:
 
-    print_summary(stats_train, stats_val)
+        row.append(
+            co_occurrence[t1][t2]
+        )
 
-    print("正在生成可视化图表...")
-    plot_entity_distribution(stats_train)
-    plot_text_length_distribution(stats_train)
-    plot_entity_length_distribution(stats_train)
+    matrix.append(row)
 
-    print("\n探索完成！图表已保存到 outputs/figures/")
-    print("下一步：python train.py               # 训练 BERT+Linear")
-    print("         python train.py --use_crf    # 训练 BERT+CRF")
+plt.figure(figsize=(8, 6))
 
+sns.heatmap(
+    matrix,
+    annot=True,
+    fmt="d",
+    xticklabels=ENTITY_TYPES,
+    yticklabels=ENTITY_TYPES
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="探索 cluener2020 数据集")
-    return parser.parse_args()
+plt.title(
+    "Entity Co-occurrence Heatmap"
+)
 
+plt.tight_layout()
 
-if __name__ == "__main__":
-    main()
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "09_entity_cooccurrence.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 图10 标签转移矩阵
+# ==========================
+
+transition = np.zeros(
+    (
+        len(LABELS),
+        len(LABELS)
+    ),
+    dtype=np.int64
+)
+
+label2id = {
+    x: i
+    for i, x in enumerate(LABELS)
+}
+
+for dataset_name, data in datasets.items():
+
+    for sample in data:
+
+        tags = sample["ner_tags"]
+
+        for i in range(
+            len(tags)-1
+        ):
+
+            transition[
+                label2id[tags[i]],
+                label2id[tags[i+1]]
+            ] += 1
+
+plt.figure(figsize=(12, 10))
+
+sns.heatmap(
+    transition,
+    xticklabels=LABELS,
+    yticklabels=LABELS,
+    cmap="Blues"
+)
+
+plt.title(
+    "BIO Transition Matrix"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "10_transition_matrix.png"
+    ),
+    dpi=300
+)
+
+plt.close()
+
+# ==========================
+# 输出文本报告
+# ==========================
+
+with open(
+    os.path.join(
+        OUTPUT_DIR,
+        "report.txt"
+    ),
+    "w",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            indent=2
+        )
+    )
+
+print("\n分析完成")
+print(f"输出目录: {OUTPUT_DIR}")
